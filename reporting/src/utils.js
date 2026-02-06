@@ -50,6 +50,20 @@ export function requireIntOrNull(value, name) {
   return value;
 }
 
+// Expects a UTC timestamp represented as Unix period:
+// - PASS: requireUTC(Date.now())
+// - FAIL: requireUTC(new Date())
+export function requireUTC(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(
+      name
+        ? `${name} should be a UTC timestamp, but got: <${value}>`
+        : `Parameter should be a UTC timestamp, but got: <${value}>`,
+    );
+  }
+  return value;
+}
+
 export function requireString(value, name) {
   if (typeof value !== 'string') {
     throw new Error(

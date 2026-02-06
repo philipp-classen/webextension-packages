@@ -72,8 +72,9 @@ describe('#ActivityEstimator', function () {
     clock?.restore();
     clock = sinon.useFakeTimers(new Date('2020-01-01'));
 
-    // workaround for a weird Sinon bug: unless a timer was set at least once, clock.jump will fail
-    // TODO: report upstream: https://github.com/sinonjs/sinon
+    // Unless a timer was set at least once, clock.jump will fail
+    // TODO: remove this workaround if this gets merged:
+    // https://github.com/sinonjs/fake-timers/pull/541
     setTimeout(() => {}, 0);
 
     listeners = new Listeners();
