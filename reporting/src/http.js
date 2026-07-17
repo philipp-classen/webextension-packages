@@ -714,7 +714,25 @@ async function anonymousHttpGet_(originalUrl, params = {}) {
               if (start > 0) {
                 const key = line.slice(0, start);
                 const value = split0(line.slice(start + 1), ';');
-                ctx.cookie0.set(key, value);
+                const oldValue = ctx.cookie0.get(key);
+                if (!oldValue) {
+                  logger.debug('onBeforeSendHeaders[found "cookie0"]:', {
+                    key,
+                    value,
+                  });
+                  ctx.cookie0.set(key, value);
+                } else if (value !== oldValue) {
+                  logger.debug(
+                    'onBeforeSendHeaders[conflict]: overwriting existing "cookie0" value:',
+                    {
+                      key,
+                      oldValue,
+                      newValue: value,
+                      details,
+                    },
+                  );
+                  ctx.cookie0.set(key, value);
+                }
               }
             }
           }
@@ -758,7 +776,25 @@ async function anonymousHttpGet_(originalUrl, params = {}) {
               if (start > 0) {
                 const key = line.slice(0, start);
                 const value = split0(line.slice(start + 1), ';');
-                ctx.cookie.set(key, value);
+                const oldValue = ctx.cookie.get(key);
+                if (!oldValue) {
+                  logger.debug('onHeaderReceived[found "cookie"]:', {
+                    key,
+                    value,
+                  });
+                  ctx.cookie.set(key, value);
+                } else if (value !== oldValue) {
+                  logger.debug(
+                    'onHeaderReceived[conflict]: overwriting existing "cookie" value:',
+                    {
+                      key,
+                      oldValue,
+                      newValue: value,
+                      details,
+                    },
+                  );
+                  ctx.cookie.set(key, value);
+                }
               }
             }
           }
