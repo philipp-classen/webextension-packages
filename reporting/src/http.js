@@ -714,7 +714,24 @@ async function anonymousHttpGet_(originalUrl, params = {}) {
               if (start > 0) {
                 const key = line.slice(0, start);
                 const value = split0(line.slice(start + 1), ';');
-                ctx.cookie0.set(key, value);
+                const oldValue = ctx.cookie0.get(key);
+                if (!oldValue) {
+                  logger.debug('onBeforeSendHeaders[found "cookie0"]:', {
+                    key,
+                    value,
+                  });
+                  ctx.cookie0.set(key, value);
+                } else if (value !== oldValue) {
+                  logger.debug(
+                    'onBeforeSendHeaders[conflict]: ignoring new, conflicting value for "cookie0":',
+                    {
+                      key,
+                      oldValue,
+                      newValue: value,
+                      details,
+                    },
+                  );
+                }
               }
             }
           }
@@ -758,7 +775,24 @@ async function anonymousHttpGet_(originalUrl, params = {}) {
               if (start > 0) {
                 const key = line.slice(0, start);
                 const value = split0(line.slice(start + 1), ';');
-                ctx.cookie.set(key, value);
+                const oldValue = ctx.cookie.get(key);
+                if (!oldValue) {
+                  logger.debug('onHeaderReceived[found "cookie"]:', {
+                    key,
+                    value,
+                  });
+                  ctx.cookie.set(key, value);
+                } else if (value !== oldValue) {
+                  logger.debug(
+                    'onHeaderReceived[conflict]: ignoring new, conflicting value for "cookie":',
+                    {
+                      key,
+                      oldValue,
+                      newValue: value,
+                      details,
+                    },
+                  );
+                }
               }
             }
           }
