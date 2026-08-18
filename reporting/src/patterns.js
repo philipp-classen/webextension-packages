@@ -418,7 +418,7 @@ export default class Patterns {
       return null;
     }
     const convert = (
-      { followRedirects, headers, steps, emptyHtml, onError },
+      { followRedirects, headers, steps, timeout, emptyHtml, onError },
       target = {},
     ) => {
       if (followRedirects) {
@@ -429,6 +429,9 @@ export default class Patterns {
       }
       if (steps) {
         target.steps = steps;
+      }
+      if (timeout) {
+        target.timeout = timeout;
       }
       if (typeof emptyHtml === 'boolean') {
         target.emptyHtml = emptyHtml;

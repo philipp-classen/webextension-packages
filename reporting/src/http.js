@@ -316,8 +316,87 @@ async function tryCloseOffscreenDocument() {
 
 const OFFSCREEN_DOCUMENT_PREFIX = 'offscreen/doublefetch';
 const OFFSCREEN_DOCUMENT_INDEX_HTML = `${OFFSCREEN_DOCUMENT_PREFIX}/index.html`;
+const OFFSCREEN_DOCUMENT_CAPTURE_JS = `${OFFSCREEN_DOCUMENT_PREFIX}/capture.js`;
+const CAPTURE_CONTENT_SCRIPT_ID = 'wtm-doublefetch-capture';
+const CAPTURE_MESSAGE_TARGET = 'doublefetch:capture';
 
-async function withOffscreenDocumentReady(url, headers, asyncCallback) {
+/**
+ * The page cannot be read from here (cross-origin), so a content script in the
+ * iframe sends the DOM back once the page looks ready. Content scripts cannot
+ * be aimed at a single frame of an offscreen document, so this one is
+ * registered for the whole domain; pages that the user opens meanwhile are
+ * covered by the guard in capture.js and by ignoring messages from a tab.
+ */
+async function installCaptureHandler(url, { waitFor = [], delay = 0 }) {
+  const { protocol, hostname } = new URL(url);
+  let resolveHtml;
+  const pendingHtml = new Promise((resolve) => {
+    resolveHtml = resolve;
+  });
+
+  const onMessage = (message, sender, sendResponse) => {
+    if (message?.target !== CAPTURE_MESSAGE_TARGET) {
+      return;
+    }
+    if (sender.tab) {
+      logger.warn(
+        'Ignoring a double-fetch capture message from a tab:',
+        sender.tab.id,
+      );
+      return;
+    }
+    if (message.type === 'hello') {
+      logger.debug('Capture script is ready in:', message.url);
+      sendResponse({ waitFor, delay });
+    } else if (message.type === 'content' && typeof message.html === 'string') {
+      logger.debug('Captured', message.html.length, 'characters');
+      resolveHtml(message.html);
+    }
+  };
+  chrome.runtime.onMessage.addListener(onMessage);
+
+  try {
+    // Leftovers are not expected (the script is registered for the duration of
+    // one step only), but the service worker could have been killed in between.
+    await chrome.scripting
+      .unregisterContentScripts({ ids: [CAPTURE_CONTENT_SCRIPT_ID] })
+      .catch(() => {});
+    await chrome.scripting.registerContentScripts([
+      {
+        id: CAPTURE_CONTENT_SCRIPT_ID,
+        // Note: match patterns have no port, so this covers any port on the host.
+        matches: [`${protocol}//${hostname}/*`],
+        js: [OFFSCREEN_DOCUMENT_CAPTURE_JS],
+        runAt: 'document_start',
+        allFrames: true,
+        world: 'ISOLATED',
+        persistAcrossSessions: false,
+      },
+    ]);
+  } catch (e) {
+    chrome.runtime.onMessage.removeListener(onMessage);
+    throw e;
+  }
+
+  return {
+    pendingHtml,
+    cleanup: async () => {
+      chrome.runtime.onMessage.removeListener(onMessage);
+      await chrome.scripting
+        .unregisterContentScripts({ ids: [CAPTURE_CONTENT_SCRIPT_ID] })
+        .catch((e) => {
+          logger.error('cleanup failed: unable to remove capture script:', e);
+        });
+    },
+  };
+}
+
+async function withOffscreenDocumentReady(
+  url,
+  headers,
+  captureConfig,
+  asyncCallback,
+) {
   const cleanups = [];
   try {
     const domain = new URL(url).hostname;
@@ -347,6 +426,13 @@ async function withOffscreenDocumentReady(url, headers, asyncCallback) {
     });
     cleanups.push(undoHeaderOverride);
 
+    let pendingHtml = null;
+    if (captureConfig) {
+      const handler = await installCaptureHandler(url, captureConfig);
+      cleanups.push(handler.cleanup);
+      pendingHtml = handler.pendingHtml;
+    }
+
     const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT_INDEX_HTML);
     const existingContexts = await chrome.runtime.getContexts({
       contextTypes: ['OFFSCREEN_DOCUMENT'],
@@ -366,7 +452,7 @@ async function withOffscreenDocumentReady(url, headers, asyncCallback) {
     });
     cleanups.push(() => tryCloseOffscreenDocument());
 
-    return await asyncCallback();
+    return await asyncCallback(pendingHtml);
   } finally {
     await Promise.all(
       cleanups.map(async (x) => {
@@ -567,6 +653,19 @@ const LOCK = new SeqExecutor();
  *     can be used in later requests. Still, the chain of requests always
  *     starts from a clean state. In other words, the temporary context is
  *     fully isolated and will be discarded once all steps have completed.
+ *
+ *     A step with "dynamic" set renders the URL in an iframe instead of
+ *     fetching it; if it is the last step, the rendered page is returned.
+ *     Two optional keys say when it counts as rendered:
+ *     * waitFor: CSS selectors that all have to match ('a, b' for either)
+ *     * delay: milliseconds to wait after that (default: 0), for pages
+ *       that render progressively
+ *     Without selectors, the delay alone decides; without either, the load
+ *     event. If the page never gets there, the step ends in a timeout.
+ * - safecookie (optional):
+ *     Allows to predefine cookies (see "findSafeCookies"). Must be an ES6 Map.
+ *     Example: if a website uses AWS WAF, steps can set
+ *     "{{safecookie:aws-waf-token}}".
  * - onError (optional):
  *     A fallback configuration for error recovery.
  * - emptyHtml (default: false):
@@ -580,7 +679,13 @@ export async function anonymousHttpGet(originalUrl, params = {}) {
 }
 
 async function anonymousHttpGet_(originalUrl, params = {}) {
-  const { steps = [], emptyHtml = false, onError, ...sharedParams } = params;
+  const {
+    steps = [],
+    emptyHtml = false,
+    onError,
+    safecookie = new Map(),
+    ...sharedParams
+  } = params;
   if (emptyHtml) {
     logger.debug('Returning empty HTML for URL:', originalUrl);
     return EMPTY_RESCUE_HTML;
@@ -588,13 +693,23 @@ async function anonymousHttpGet_(originalUrl, params = {}) {
 
   try {
     if (steps.length === 0) {
-      return await singleHttpGetStep(originalUrl, sharedParams);
+      const headers =
+        sharedParams.headers &&
+        replacePlaceholders(sharedParams.headers, { safecookie });
+      return await singleHttpGetStep(originalUrl, { ...sharedParams, headers });
     }
     if (!chrome?.webRequest?.onHeadersReceived) {
       throw new MultiStepDoublefetchNotSupportedError();
     }
     const hasDynamicSteps = steps.some((x) => x.dynamic);
     if (hasDynamicSteps && !chrome?.offscreen?.createDocument) {
+      throw new DynamicDoublefetchNotSupportedError();
+    }
+    // Reading the rendered page needs a content script in the iframe.
+    if (
+      steps[steps.length - 1].dynamic &&
+      !chrome?.scripting?.registerContentScripts
+    ) {
       throw new DynamicDoublefetchNotSupportedError();
     }
 
@@ -612,6 +727,7 @@ async function anonymousHttpGet_(originalUrl, params = {}) {
         cookie: new Map(), // default ('set-cookies' in response)
         cookie0: new Map(), // fallback ('cookies' in request)
         param: new Map(), // URL params
+        safecookie,
       },
       observer,
     );
@@ -635,7 +751,7 @@ async function anonymousHttpGet_(originalUrl, params = {}) {
         }
 
         try {
-          const graph = buildDependencyGraph(nextStep);
+          const graph = buildDependencyGraph(nextStep, ctx);
           if (graph.allReady) {
             resolve();
             return;
@@ -749,14 +865,19 @@ async function anonymousHttpGet_(originalUrl, params = {}) {
       }
       try {
         if (currentStep.dynamic) {
-          // TODO: getting content of the last step is currently not implemented.
-          // If needed, one idea is to use content scripts in the offscreen document.
-          content = '';
+          // The content comes from the last step, so only it needs a capture.
+          const captureConfig = nextStep
+            ? null
+            : {
+                waitFor: localParams.waitFor,
+                delay: localParams.delay,
+              };
 
           await withOffscreenDocumentReady(
             localUrl,
             localParams.headers,
-            async () => {
+            captureConfig,
+            async (pendingHtml) => {
               const { ok, error } = await chrome.runtime.sendMessage({
                 target: 'offscreen:urlReporting',
                 type: 'request',
@@ -770,7 +891,7 @@ async function anonymousHttpGet_(originalUrl, params = {}) {
 
               let timeout = null;
               const timedOut = new Promise((resolve, reject) => {
-                const maxTime = params.timeout || 15 * SECOND;
+                const maxTime = localParams.timeout || 15 * SECOND;
                 timeout = setTimeout(() => {
                   timeout = null;
                   logger.warn(
@@ -790,7 +911,13 @@ async function anonymousHttpGet_(originalUrl, params = {}) {
                 }, maxTime);
               });
               try {
-                await Promise.race([readyForNextStep, timedOut]);
+                // The last step waits for the rendered page, the others for
+                // the values that the step after them needs.
+                if (pendingHtml) {
+                  content = await Promise.race([pendingHtml, timedOut]);
+                } else {
+                  await Promise.race([readyForNextStep, timedOut]);
+                }
               } finally {
                 clearTimeout(timeout);
               }
@@ -811,6 +938,7 @@ async function anonymousHttpGet_(originalUrl, params = {}) {
     if (onError) {
       const rescueParams = {
         ...sharedParams,
+        safecookie,
         ...onError,
       };
       logger.info(
@@ -859,6 +987,9 @@ export function replacePlaceholders(headers, ctx) {
           } else if (expr.startsWith('param:')) {
             const key = expr.slice('param:'.length);
             resolved = ctx.param.get(key);
+          } else if (expr.startsWith('safecookie:')) {
+            const key = expr.slice('safecookie:'.length);
+            resolved = ctx.safecookie.get(key);
           } else {
             throw new Error(
               `Unsupported expression: stopped at <<${expr}>> (full expression: ${fullExpression})`,
@@ -894,7 +1025,7 @@ export function findPlaceholders(text) {
 }
 
 // Note: exported for tests only
-export function buildDependencyGraph(nextStep) {
+export function buildDependencyGraph(nextStep, ctx = {}) {
   const graph = {
     allReady: true,
     onChange: null,
@@ -967,6 +1098,15 @@ export function buildDependencyGraph(nextStep) {
           }
         };
       }
+    }
+  }
+
+  // A value that the context already holds (a borrowed cookie, or one that an
+  // earlier step captured) will not be set again, so feed it through the same
+  // path that a later value would take.
+  for (const [type, values] of Object.entries(ctx)) {
+    for (const [key, value] of values) {
+      graph.onChange?.(type, key, value);
     }
   }
   return graph;

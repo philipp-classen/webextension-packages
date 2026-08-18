@@ -117,6 +117,32 @@ describe('#replacePlaceholders', function () {
   });
 });
 
+describe('#replacePlaceholders with borrowed cookies', function () {
+  const ctx = {
+    cookie: new Map(),
+    safecookie: new Map([['aws-waf-token', 'the-token']]),
+  };
+  const resolve = (template) => replacePlaceholders({ C: template }, ctx).C;
+
+  it('should resolve a borrowed cookie', function () {
+    expect(resolve('t={{safecookie:aws-waf-token}}')).to.eql('t=the-token');
+  });
+
+  it('should be empty if the cookie was not borrowed', function () {
+    expect(resolve('{{safecookie:cf_clearance}}')).to.eql('');
+  });
+
+  it('should take part in "||" alternatives', function () {
+    expect(resolve('{{cookie:absent||safecookie:aws-waf-token}}')).to.eql(
+      'the-token',
+    );
+  });
+
+  it('should still reject an unsupported placeholder type', function () {
+    expect(() => resolve('{{cookies:x}}')).to.throw(/Unsupported expression/);
+  });
+});
+
 describe('#findPlaceholders', function () {
   it('should work with empty strings', function () {
     expect(findPlaceholders('')).to.eql([]);
@@ -152,6 +178,47 @@ describe('#findPlaceholders', function () {
 
   describe('should support short-circuit evaluation with "||"', function () {
     expect(findPlaceholders('abc={{foo||bar}}')).to.eql(['foo||bar']);
+  });
+});
+
+describe('#buildDependencyGraph with a prefilled context', function () {
+  const borrowed = { safecookie: new Map([['aws-waf-token', 'the-token']]) };
+  const nextStep = { headers: { Cookie: 't={{safecookie:aws-waf-token}}' } };
+
+  it('should not wait for a borrowed cookie', function () {
+    expect(buildDependencyGraph(nextStep, borrowed).allReady).to.eql(true);
+  });
+
+  it('should not wait for a value that an earlier step captured', function () {
+    const ctx = { cookie: new Map([['FOO', 'captured by an earlier step']]) };
+    expect(
+      buildDependencyGraph({ headers: { Cookie: '{{cookie:FOO}}' } }, ctx)
+        .allReady,
+    ).to.eql(true);
+  });
+
+  it('should wait if the context cannot answer it', function () {
+    expect(
+      buildDependencyGraph(nextStep, { safecookie: new Map() }).allReady,
+    ).to.eql(false);
+  });
+
+  it('should still wait for the parts that are missing', function () {
+    const graph = buildDependencyGraph(
+      {
+        headers: { Cookie: 't={{safecookie:aws-waf-token}};S={{param:sg_ss}}' },
+      },
+      borrowed,
+    );
+    expect(graph.allReady).to.eql(false);
+
+    let onReadyCalled = 0;
+    graph.onReady = () => {
+      onReadyCalled += 1;
+    };
+    graph.onChange('param', 'sg_ss', 'dummy value');
+    expect(onReadyCalled).to.eql(1);
+    expect(graph.allReady).to.eql(true);
   });
 });
 
